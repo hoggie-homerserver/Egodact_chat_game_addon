@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Egodact Addon: Chat Arcade",
+  "version": "0.1.0",
+  "description": "Boter-kaas-en-eieren and Connect 4 for Egodact, with streaks, a daily goal and score sharing in chat.",
+  "content_scripts": [
+    {
+      "matches": ["https://app.egodact.com/*"],
+      "js": ["sdk.js", "lib.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["storage"]
+}
