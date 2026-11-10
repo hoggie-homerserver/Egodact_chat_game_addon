@@ -16,7 +16,7 @@
     const { ui, theme, el, data } = L;
 
     const ADDON_ID = 'egodact-chat-arcade';
-    const VERSION = '0.1.0';
+    const VERSION = '0.2.0';
 
     const ICON =
         '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
@@ -772,6 +772,7 @@
                 ui.tabs([
                     { title: 'Boter-kaas-en-eieren', render: renderTTT },
                     { title: 'Connect 4', render: renderC4 },
+                    { title: 'Samen spelen', render: renderOnline },
                     { title: 'Stats', render: renderStats }
                 ])
             ]
@@ -779,6 +780,522 @@
 
         currentBackdrop = ui.modal('Chat Arcade', body, {
             width: 'min(580px, calc(100vw - 32px))'
+        });
+    }
+
+    // ------------------------------------------------------------
+    // Online multiplayer (Firestore, same project as the Chat addon)
+    // ------------------------------------------------------------
+    const FIREBASE_CONFIG = {
+        apiKey: 'AIzaSyBF-ejVI_I3kmjXxjZlMGwyd3SZupQoFqY',
+        authDomain: 'egodact-extension.firebaseapp.com',
+        projectId: 'egodact-extension',
+        storageBucket: 'egodact-extension.firebasestorage.app',
+        messagingSenderId: '19331909527',
+        appId: '1:19331909527:web:c86f39f6c8a0e0a5b026d2'
+    };
+
+    let myId = store.get('playerId', null);
+    if (!myId || typeof myId !== 'string') {
+        myId = 'arcade-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-3);
+        store.set('playerId', myId);
+    }
+    let myName = store.get('playerName', 'Speler');
+    if (!myName || typeof myName !== 'string') myName = 'Speler';
+
+    const fb = { ready: false, db: null, auth: null };
+
+    async function ensureFirebase() {
+        if (fb.ready) return fb;
+        if (typeof firebase === 'undefined' || !firebase.initializeApp) {
+            throw new Error('Firebase is niet geladen (wordt de vendor-map meegeleverd?)');
+        }
+        if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+        fb.auth = firebase.auth();
+        try {
+            await fb.auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+        } catch (e) {}
+        if (!fb.auth.currentUser) {
+            await fb.auth.signInAnonymously();
+        }
+        fb.db = firebase.firestore();
+        fb.ready = true;
+        return fb;
+    }
+
+    const online = {
+        active: false,
+        loading: false,
+        error: null,
+        code: '',
+        roomId: '',
+        roomRef: null,
+        unsub: null,
+        arcade: null,
+        state: null,
+        game: 'ttt',
+        role: null,
+        symbol: null,
+        paint: null,
+        newGame: 'ttt'
+    };
+
+    function randomCode() {
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        let out = '';
+        for (let i = 0; i < 5; i++) out += chars[Math.floor(Math.random() * chars.length)];
+        return out;
+    }
+
+    function normalizeCode(raw) {
+        return String(raw || '')
+            .toUpperCase()
+            .replace(/^ARCADE[-\s]*/, '')
+            .replace(/[^A-Z0-9]/g, '')
+            .slice(0, 8);
+    }
+
+    function onlineGameLabel(game) {
+        return game === 'c4' ? 'Connect 4' : 'Boter-kaas-en-eieren';
+    }
+
+    function initialOnlineState(game) {
+        return {
+            board: game === 'c4' ? new Array(C4_ROWS * C4_COLS).fill('') : new Array(9).fill(''),
+            turn: game === 'c4' ? 'R' : 'X',
+            over: false,
+            result: null,
+            gameId: Date.now()
+        };
+    }
+
+    function onlineSetState(arcade) {
+        online.arcade = arcade || {};
+        online.game = online.arcade.game === 'c4' ? 'c4' : 'ttt';
+        online.state = online.arcade.state || null;
+        if (online.arcade.hostId === myId) {
+            online.role = 'host';
+            online.symbol = online.game === 'c4' ? 'R' : 'X';
+        } else if (online.arcade.guestId === myId) {
+            online.role = 'guest';
+            online.symbol = online.game === 'c4' ? 'Y' : 'O';
+        } else {
+            online.role = null;
+            online.symbol = null;
+        }
+    }
+
+    function onlineSubscribe(ref) {
+        if (online.unsub) {
+            try { online.unsub(); } catch (e) {}
+            online.unsub = null;
+        }
+        online.roomRef = ref;
+        online.unsub = ref.onSnapshot(function (snap) {
+            if (!snap.exists) {
+                online.error = 'Deze room bestaat niet meer.';
+                online.active = false;
+                if (online.paint) online.paint();
+                return;
+            }
+            const data = snap.data() || {};
+            if (!data.arcade) {
+                online.error = 'Deze room is geen Chat Arcade-room.';
+                if (online.paint) online.paint();
+                return;
+            }
+            online.error = null;
+            online.active = true;
+            online.code = String(ref.id).replace(/^arcade-/, '');
+            online.roomId = ref.id;
+            onlineSetState(data.arcade);
+            if (online.paint) online.paint();
+        }, function (err) {
+            online.error = 'Verbinding mislukt: ' + (err.message || err);
+            if (online.paint) online.paint();
+        });
+    }
+
+    function onlineLeave() {
+        if (online.unsub) {
+            try { online.unsub(); } catch (e) {}
+        }
+        online.unsub = null;
+        online.roomRef = null;
+        online.active = false;
+        online.loading = false;
+        online.error = null;
+        online.code = '';
+        online.roomId = '';
+        online.arcade = null;
+        online.state = null;
+        online.role = null;
+        online.symbol = null;
+        if (online.paint) online.paint();
+    }
+
+    function onlineWriteState(nextState) {
+        if (!online.roomRef || typeof firebase === 'undefined') return;
+        const arcade = Object.assign({}, online.arcade || {}, {
+            state: nextState,
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        online.arcade = arcade;
+        online.state = nextState;
+        if (online.paint) online.paint();
+        online.roomRef.update({
+            arcade: arcade,
+            members: [arcade.hostId || myId, arcade.guestId || 'arcade-pending']
+        }).catch(function (err) {
+            online.error = 'Zet mislukt: ' + (err.message || err);
+            if (online.paint) online.paint();
+        });
+    }
+
+    async function createOnlineRoom(game) {
+        online.error = null;
+        online.loading = true;
+        if (online.paint) online.paint();
+        try {
+            const f = await ensureFirebase();
+            const code = randomCode();
+            const state = initialOnlineState(game);
+            const arcade = {
+                v: 1,
+                game: game,
+                hostId: myId,
+                hostName: myName,
+                guestId: null,
+                guestName: '',
+                state: state,
+                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            };
+            const ref = f.db.collection('rooms').doc('arcade-' + code);
+            await ref.set({
+                type: 'dm',
+                members: [myId, 'arcade-pending'],
+                createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+                arcade: arcade
+            });
+            online.code = code;
+            online.roomId = ref.id;
+            online.newGame = game;
+            onlineSubscribe(ref);
+        } catch (err) {
+            online.error = err && err.message ? err.message : String(err);
+        }
+        online.loading = false;
+        if (online.paint) online.paint();
+    }
+
+    async function joinOnlineRoom(rawCode) {
+        const code = normalizeCode(rawCode);
+        if (!code) {
+            online.error = 'Vul een code in.';
+            if (online.paint) online.paint();
+            return;
+        }
+        online.error = null;
+        online.loading = true;
+        if (online.paint) online.paint();
+        try {
+            const f = await ensureFirebase();
+            const ref = f.db.collection('rooms').doc('arcade-' + code);
+            const snap = await ref.get();
+            if (!snap.exists) throw new Error('Deze code bestaat niet (meer).');
+            const data = snap.data() || {};
+            const arcade = data.arcade || {};
+            if (arcade.hostId !== myId) {
+                if (arcade.guestId && arcade.guestId !== myId) {
+                    throw new Error('Deze room is al vol.');
+                }
+                const updated = Object.assign({}, arcade, {
+                    guestId: myId,
+                    guestName: myName,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                });
+                await ref.update({
+                    members: [arcade.hostId || 'arcade-host', myId],
+                    arcade: updated
+                });
+            }
+            online.code = code;
+            online.roomId = ref.id;
+            onlineSubscribe(ref);
+        } catch (err) {
+            online.error = err && err.message ? err.message : String(err);
+        }
+        online.loading = false;
+        if (online.paint) online.paint();
+    }
+
+    function onlineInviteText() {
+        return 'Chat Arcade - ' + onlineGameLabel(online.game) + '\n' +
+            'Code: ' + online.code + '\n' +
+            'Open Chat Arcade (F9) -> Samen spelen -> Deelnemen en plak de code.';
+    }
+
+    function onlineMoveTTT(index) {
+        const st = online.state;
+        if (!st || st.over || !online.symbol) return;
+        if (!online.arcade || !online.arcade.guestId) return;
+        if (st.turn !== online.symbol || st.board[index]) return;
+        const board = st.board.slice();
+        board[index] = online.symbol;
+        const winner = tttWinner(board);
+        onlineWriteState({
+            board: board,
+            turn: online.symbol === 'X' ? 'O' : 'X',
+            over: !!winner,
+            result: winner || null,
+            gameId: st.gameId
+        });
+    }
+
+    function onlineMoveC4(col) {
+        const st = online.state;
+        if (!st || st.over || !online.symbol) return;
+        if (!online.arcade || !online.arcade.guestId) return;
+        if (st.turn !== online.symbol) return;
+        const board = st.board.slice();
+        const row = c4DropRow(board, col);
+        if (row < 0) return;
+        board[row * C4_COLS + col] = online.symbol;
+        let result = null;
+        if (c4Winner(board, 'R')) result = 'R';
+        else if (c4Winner(board, 'Y')) result = 'Y';
+        else if (board.every(Boolean)) result = 'draw';
+        onlineWriteState({
+            board: board,
+            turn: online.symbol === 'R' ? 'Y' : 'R',
+            over: !!result,
+            result: result,
+            gameId: st.gameId
+        });
+    }
+
+    function onlineStatusText() {
+        const st = online.state;
+        if (!st) return 'Verbinden...';
+        if (!online.symbol) return 'Je kijkt mee met deze room.';
+        if (!online.arcade || !online.arcade.guestId) return 'Wachten op tegenstander...';
+        if (st.over) {
+            if (st.result === 'draw' || !st.result) return 'Gelijkspel';
+            return st.result === online.symbol ? 'Jij wint!' : 'Tegenstander wint';
+        }
+        if (st.turn === online.symbol) return 'Jouw beurt';
+        const other = online.role === 'host' ? (online.arcade.guestName || 'tegenstander') : (online.arcade.hostName || 'tegenstander');
+        return 'Wachten op ' + other + '...';
+    }
+
+    function onlineBoard() {
+        const t = theme();
+        const st = online.state;
+        if (!st) return el('div', { text: 'Verbinden...', style: { fontSize: '12px', color: t.tekstZacht } });
+
+        if (online.game === 'c4') {
+            const grid = el('div', {
+                style: {
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(' + C4_COLS + ', 38px)',
+                    gap: '4px',
+                    justifyContent: 'center',
+                    padding: '8px',
+                    background: t.veld,
+                    border: '1px solid ' + t.rand,
+                    borderRadius: '10px'
+                }
+            });
+            for (let r = 0; r < C4_ROWS; r++) {
+                for (let c = 0; c < C4_COLS; c++) {
+                    const value = st.board[r * C4_COLS + c];
+                    grid.appendChild(el('button', {
+                        type: 'button',
+                        onClick: function () { onlineMoveC4(c); },
+                        style: {
+                            width: '38px',
+                            height: '38px',
+                            padding: '0',
+                            borderRadius: '50%',
+                            border: '1px solid ' + t.rand,
+                            background: value === 'R' ? C4_RED : (value === 'Y' ? C4_YELLOW : 'transparent'),
+                            cursor: (!st.over && st.turn === online.symbol && online.arcade && online.arcade.guestId) ? 'pointer' : 'default'
+                        }
+                    }));
+                }
+            }
+            return grid;
+        }
+
+        const grid = el('div', {
+            style: {
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, 64px)',
+                gap: '6px',
+                justifyContent: 'center'
+            }
+        });
+        st.board.forEach(function (value, index) {
+            grid.appendChild(el('button', {
+                type: 'button',
+                text: value || '',
+                onClick: function () { onlineMoveTTT(index); },
+                style: {
+                    width: '64px',
+                    height: '64px',
+                    fontSize: '26px',
+                    fontWeight: 'bold',
+                    borderRadius: '8px',
+                    border: '1px solid ' + t.rand,
+                    background: t.veld,
+                    color: value === 'X' ? t.accent : (value === 'O' ? '#ffb74d' : t.tekst),
+                    cursor: (!st.over && st.turn === online.symbol && !value && online.arcade && online.arcade.guestId) ? 'pointer' : 'default'
+                }
+            }));
+        });
+        return grid;
+    }
+
+    function renderOnline() {
+        return makePaintable(function (root, paint) {
+            online.paint = paint;
+            const t = theme();
+
+            if (online.error) {
+                root.appendChild(el('div', {
+                    text: online.error,
+                    style: {
+                        padding: '8px 10px',
+                        borderRadius: '6px',
+                        background: '#4a1d1d',
+                        border: '1px solid #a33',
+                        color: '#ffd7d7',
+                        fontSize: '12px'
+                    }
+                }));
+            }
+
+            if (!online.active) {
+                const nameInput = ui.input({ value: myName, placeholder: 'Je naam', width: '170px' });
+                root.appendChild(ui.row({
+                    gap: 6,
+                    wrap: true,
+                    children: [
+                        el('span', { text: 'Naam', style: { fontSize: '12px', color: t.tekstZacht } }),
+                        nameInput,
+                        ui.button('Opslaan', function () {
+                            const value = String(nameInput.value || '').trim().slice(0, 24);
+                            if (!value) return;
+                            myName = value;
+                            store.set('playerName', value);
+                            try { ui.toast('Naam opgeslagen', { type: 'success' }); } catch (e) {}
+                            paint();
+                        }, { padding: '6px 10px', fontSize: '12px' })
+                    ]
+                }));
+
+                root.appendChild(ui.card({
+                    padding: '12px',
+                    children: [
+                        el('div', { text: 'Uitdaging maken', style: { fontSize: '13px', fontWeight: 'bold', color: t.tekst, marginBottom: '8px' } }),
+                        ui.row({
+                            gap: 6,
+                            children: [
+                                segmented('Boter-kaas-en-eieren', online.newGame === 'ttt', function () {
+                                    online.newGame = 'ttt';
+                                    paint();
+                                }),
+                                segmented('Connect 4', online.newGame === 'c4', function () {
+                                    online.newGame = 'c4';
+                                    paint();
+                                })
+                            ]
+                        }),
+                        ui.button(online.loading ? 'Bezig...' : 'Maak code', function () {
+                            if (online.loading) return;
+                            createOnlineRoom(online.newGame);
+                        }, { padding: '8px 12px', fontSize: '13px' }),
+                        el('div', {
+                            text: 'Je krijgt een code. Plak die in de chat, je tegenstander vult hem hier in.',
+                            style: { fontSize: '11px', color: t.tekstZacht, marginTop: '8px' }
+                        })
+                    ]
+                }));
+
+                const joinInput = ui.input({ placeholder: 'Code, bijv. 7K2M9', width: '140px' });
+                root.appendChild(ui.card({
+                    padding: '12px',
+                    children: [
+                        el('div', { text: 'Deelnemen', style: { fontSize: '13px', fontWeight: 'bold', color: t.tekst, marginBottom: '8px' } }),
+                        ui.row({
+                            gap: 6,
+                            wrap: true,
+                            children: [
+                                joinInput,
+                                ui.button('Deelnemen', function () {
+                                    if (online.loading) return;
+                                    joinOnlineRoom(joinInput.value);
+                                }, {
+                                    padding: '8px 12px',
+                                    fontSize: '13px',
+                                    background: t.veld,
+                                    color: t.tekst
+                                })
+                            ]
+                        })
+                    ]
+                }));
+
+                root.appendChild(el('div', {
+                    text: 'Online potjes tellen niet mee voor je dagdoel.',
+                    style: { fontSize: '11px', color: t.tekstZacht }
+                }));
+                return;
+            }
+
+            // In a room
+            root.appendChild(ui.row({
+                gap: 6,
+                wrap: true,
+                children: [
+                    chip('Code: ' + online.code),
+                    chip(onlineGameLabel(online.game)),
+                    chip(online.role === 'host' ? 'Jij host' : 'Jij gast'),
+                    chip(online.arcade && online.arcade.guestId ? 'Tegenstander erbij' : 'Nog alleen')
+                ]
+            }));
+
+            root.appendChild(statusBar(onlineStatusText()));
+            root.appendChild(onlineBoard());
+
+            const buttons = [
+                ui.button('Kopieer code', function () {
+                    copyText(onlineInviteText(), 'Uitnodiging gekopieerd - plak hem in de chat!');
+                }, { padding: '7px 10px', fontSize: '12px' }),
+                ui.button('Open chat', function () { openChat(); }, {
+                    padding: '7px 10px',
+                    fontSize: '12px',
+                    background: t.veld,
+                    color: t.tekst
+                })
+            ];
+
+            if (online.state && online.state.over) {
+                buttons.push(ui.button('Nieuw potje', function () {
+                    onlineWriteState(initialOnlineState(online.game));
+                }, { padding: '7px 10px', fontSize: '12px' }));
+            }
+
+            buttons.push(ui.button('Verlaten', function () {
+                onlineLeave();
+            }, {
+                padding: '7px 10px',
+                fontSize: '12px',
+                background: '#7f1d1d',
+                color: '#fff'
+            }));
+
+            root.appendChild(ui.row({ gap: 6, wrap: true, justify: 'center', children: buttons }));
         });
     }
 
