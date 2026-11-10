@@ -793,21 +793,6 @@
         author: 'MaxiTaxi'
     });
 
-    client.registerMenu({
-        addonId: ADDON_ID,
-        id: 'arcade-menu',
-        title: 'Chat Arcade',
-        icon: ICON
-    });
-
-    client.registerButton({
-        addonId: ADDON_ID,
-        id: 'arcade-button',
-        title: 'Chat Arcade',
-        icon: ICON,
-        position: 'header'
-    });
-
     L.hamburger.add({
         addonId: ADDON_ID,
         id: 'arcade-hamburger',
@@ -816,9 +801,6 @@
         order: 40
     });
     L.hamburger.onOpen('arcade-hamburger', openArcade);
-
-    client.onOpen('arcade-menu', openArcade);
-    client.onOpen('arcade-button', openArcade);
 
     L.shortcuts.add({
         addonId: ADDON_ID,

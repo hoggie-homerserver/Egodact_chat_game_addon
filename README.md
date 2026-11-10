@@ -1,6 +1,6 @@
 # Egodact Addon: Chat Arcade
 
-Turn-based mini-games for [Egodact](https://app.egodact.com), built as a separate addon extension. Adds a game hub to the hamburger menu, a topbar button and a global shortcut.
+Turn-based mini-games for [Egodact](https://app.egodact.com), built as a separate addon extension. Adds a game hub to the hamburger menu and a global shortcut.
 
 ## Games
 
@@ -14,7 +14,6 @@ Turn-based mini-games for [Egodact](https://app.egodact.com), built as a separat
 - **Share your score in chat**: copies a ready-to-paste score line and can open the Egodact Chat addon directly.
 - **Shortcut**: `F9` opens Chat Arcade (rebindable in Hamburger -> Sneltoetsen).
 - **Hamburger item**: Chat Arcade.
-- **Topbar button**: gamepad icon.
 
 ## Install
 
